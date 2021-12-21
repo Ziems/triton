@@ -1,5 +1,6 @@
 import copy
 import itertools
+import re
 from typing import Optional, Union
 
 import numpy as np
@@ -9,14 +10,19 @@ from numpy.random import RandomState
 
 import triton
 import triton.language as tl
-from triton.code_gen import TensorWrapper
+from triton.code_gen import TensorWrapper, reinterpret
 
 int_dtypes = ['int8', 'int16', 'int32', 'int64']
 uint_dtypes = ['uint8', 'uint16', 'uint32', 'uint64']
 float_dtypes = ['float16', 'float32', 'float64']
 dtypes = int_dtypes + uint_dtypes + float_dtypes
 
-def numpy_random(shape, dtype_str, rs: Optional[RandomState] = None):
+def _bitwidth(dtype: str) -> int:
+    # ex.: "int64" -> 64
+    return int(re.search(r'(\d+)$', dtype).group(1))
+
+
+def numpy_random(shape, dtype_str, rs: Optional[RandomState] = None, low=None, high=None):
     if isinstance(shape, int):
         shape = (shape, )
     if rs is None:
@@ -27,7 +33,9 @@ def numpy_random(shape, dtype_str, rs: Optional[RandomState] = None):
         return rs.randint(0, 2, shape, dtype=dtype)
     elif dtype_str in int_dtypes or dtype_str in uint_dtypes:
         iinfo = np.iinfo(getattr(np, dtype_str))
-        x = rs.randint(iinfo.min, iinfo.max, shape, dtype=dtype)
+        low = iinfo.min if low is None else max(low, iinfo.min)
+        high = iinfo.max if high is None else min(high, iinfo.max)
+        x = rs.randint(low, high, shape, dtype=dtype)
         x[x == 0] = 1
         return x
     elif dtype_str in float_dtypes:
@@ -41,7 +49,7 @@ def numpy_to_triton(x: np.ndarray, device='cuda') -> Union[TensorWrapper, torch.
     if t in uint_dtypes:
         signed_type_name = t.lstrip('u')  # e.g. "uint16" -> "int16"
         x_signed = x.astype(getattr(np, signed_type_name))
-        return TensorWrapper(torch.tensor(x_signed, device=device), getattr(tl, t))
+        return reinterpret(torch.tensor(x_signed, device=device), getattr(tl, t))
     else:
         return torch.tensor(x, device=device)
 
@@ -64,16 +72,6 @@ def triton_to_numpy(x):
         return np.array(x.cpu(), dtype=dtype)
     else:
         raise ValueError(f"Not a triton-compatible tensor: {x}")
-
-
-def triton_empty_like(x):
-    if isinstance(x, TensorWrapper):
-        return TensorWrapper(torch.empty_like(x.base), dtype=x.dtype)
-    elif isinstance(x, torch.Tensor):
-        return torch.empty_like(x)
-    else:
-        raise ValueError(f"Not a triton-compatible tensor: {x}")
-
 
 
 def patch_kernel(template, to_replace):
@@ -121,6 +119,12 @@ def _test_unary(dtype_x, expr, numpy_expr=None, device='cuda'):
 
 def _binary_op_dtype_override(a: str, b: str) -> Optional[np.dtype]:
     overrides = {
+        ('float16', 'int16'): np.float16,
+        ('float16', 'int32'): np.float16,
+        ('float16', 'int64'): np.float16,
+        ('float16', 'uint16'): np.float16,
+        ('float16', 'uint32'): np.float16,
+        ('float16', 'uint64'): np.float16,
         ('int8', 'uint8'): np.uint8,
         ('int8', 'uint16'): np.uint16,
         ('int8', 'uint32'): np.uint32,
@@ -136,11 +140,12 @@ def _binary_op_dtype_override(a: str, b: str) -> Optional[np.dtype]:
     return overrides.get(key)
 
 
-def _test_binary(dtype_x, dtype_y, expr, torch_expr=None, mode_x='real', mode_y='real', device='cuda'):
+def _test_binary(dtype_x, dtype_y, expr, torch_expr=None, mode_x='real', mode_y='real', device='cuda', y_low=None, y_high=None):
     SIZE = 128
     # define the kernel / launch-grid
     @triton.jit
     def kernel(Z, X, Y, SIZE: tl.constexpr):
+        # print('ZXYZXYZXY', Z, X, Y)
         off = tl.arange(0, SIZE)
         x = tl.load(X + off)  # noqa: F841
         y = tl.load(Y + off)  # noqa: F841
@@ -151,7 +156,7 @@ def _test_binary(dtype_x, dtype_y, expr, torch_expr=None, mode_x='real', mode_y=
     # inputs
     rs = RandomState(17)
     x = numpy_random(SIZE, dtype_str=dtype_x, rs=rs)
-    y = numpy_random(SIZE, dtype_str=dtype_y, rs=rs)
+    y = numpy_random(SIZE, dtype_str=dtype_y, rs=rs, low=y_low, high=y_high)
     if mode_x == 'nan': x[:] = float('nan')
     if mode_y == 'nan': y[:] = float('nan')
     # reference result
@@ -163,8 +168,14 @@ def _test_binary(dtype_x, dtype_y, expr, torch_expr=None, mode_x='real', mode_y=
     x_tri = numpy_to_triton(x, device=device)
     y_tri = numpy_to_triton(y, device=device)
     z_tri = numpy_to_triton(np.empty(SIZE, dtype=z_ref.dtype), device=device)
-    kernel[(1, )](z_tri, x_tri, y_tri, SIZE=SIZE, num_warps=4)
+    pgm = kernel[(1, )](z_tri, x_tri, y_tri, SIZE=SIZE, num_warps=4)
+    #print(pgm.asm['ptx'])
     # compare
+    #print('xxx', x_tri)
+    #print('yyy', y_tri)
+    #print('z_ref', z_ref, z_ref.dtype)
+    #print('z_tri', triton_to_numpy(z_tri), triton_to_numpy(z_tri).dtype)
+    #print('z_tri (torch)', z_tri)
     np.testing.assert_allclose(z_ref, triton_to_numpy(z_tri), err_msg=expr, rtol=0.01)
 
 
@@ -189,6 +200,11 @@ def _mod_operation_ill_conditioned(dtype_x, dtype_y) -> bool:
         ('int64', 'float16'),
         ('int64', 'float32'),
         ('int64', 'float64'),
+        ('uint32', 'float16'),
+        ('uint32', 'float32'),
+        ('uint64', 'float16'),
+        ('uint64', 'float32'),
+        ('uint64', 'float64'),
     ]
 
 # ---------------
@@ -202,19 +218,27 @@ def _mod_operation_ill_conditioned(dtype_x, dtype_y) -> bool:
 ])
 def test_bin_op(dtype_x, dtype_y, op, device='cuda'):
     expr = f' x {op} y'
-    if op == '%' and dtype_x in int_dtypes and dtype_y in int_dtypes:
+    if op == '%' and dtype_x in int_dtypes + uint_dtypes and dtype_y in int_dtypes + uint_dtypes:
         # LLVM has 'torch.fmod', not 'torch.remainder' semantics on integer remainders.
-        torch_expr = '_fake_fmod(x, y)'
+        # torch_expr = '_fake_fmod(x, y)'
+        torch_expr = 'np.fmod(x, y)'
     elif op in ('/', '%') and dtype_x in ('int16', 'float16') and dtype_y in ('int16', 'float16'):
         # Triton promotes 16-bit floating-point / and % to 32-bit because there
         # are no native div or FRem operations on float16. Since we have to
         # convert anyway, we may as well take the accuracy bump.
-        torch_expr = f'x.to(torch.float32) {op} y.to(torch.float32)'
+        torch_expr = f'x.astype(np.float32) {op} y.astype(np.float32)'
+    elif (dtype_x in uint_dtypes and dtype_y in int_dtypes and _bitwidth(dtype_x) >= _bitwidth(dtype_y)):
+        torch_expr = f'x.astype(np.{dtype_x}) {op} y.astype(np.{dtype_x})'
+    elif (dtype_y in uint_dtypes and dtype_x in int_dtypes and _bitwidth(dtype_y) >= _bitwidth(dtype_x)):
+        torch_expr = f'x.astype(np.{dtype_y}) {op} y.astype(np.{dtype_y})'
     else:
         torch_expr = None
+    #print("XXXXXXXX", torch_expr)
     if op == '%' and _mod_operation_ill_conditioned(dtype_x, dtype_y):
-        with pytest.raises(AssertionError, match='Arrays are not almost equal'):
+        with pytest.raises(AssertionError, match='Not equal to tolerance'):
             _test_binary(dtype_x, dtype_y, expr, torch_expr=torch_expr, device=device)
+    elif op in ('%', '/') and ((dtype_x in int_dtypes and dtype_y in uint_dtypes) or (dtype_x in uint_dtypes and dtype_y in int_dtypes)):
+        pass  # FIXME
     else:
         _test_binary(dtype_x, dtype_y, expr, torch_expr=torch_expr, device=device)
 
@@ -223,46 +247,73 @@ def test_bin_op(dtype_x, dtype_y, op, device='cuda'):
 # ---------------
 # test bitwise ops
 # ---------------
-@pytest.mark.parametrize("dtype_x, dtype_y, expr", [
-    (dtype_x, dtype_y, f'x{op}y') \
-  for op in ['&', '|', '^'] \
-  for dtype_x in dtypes \
-  for dtype_y in dtypes
+@pytest.mark.parametrize("dtype_x, dtype_y, op", [
+    (dtype_x, dtype_y, op)
+    for op in ['&', '|', '^']
+    for dtype_x in dtypes
+    for dtype_y in dtypes
 ])
-def test_bitwise_op(dtype_x, dtype_y, expr, device='cuda'):
-    if 'float' in dtype_x + dtype_y:
-        with pytest.raises(TypeError):
-            _test_binary(dtype_x, dtype_y, expr, device=device)
-    elif (dtype_x == 'uint64'  and dtype_y in int_dtypes) or (dtype_x in int_dtypes and dtype_y == 'uint64'):
-        # TODO(madeleine): Make sure Triton raises an error. This one is from numpy.
-        with pytest.raises(TypeError):
-            _test_binary(dtype_x, dtype_y, expr, device=device)
+def test_bitwise_op(dtype_x, dtype_y, op, device='cuda'):
+    expr = f'x {op} y'
+    if (dtype_x in uint_dtypes and dtype_y in int_dtypes and _bitwidth(dtype_x) >= _bitwidth(dtype_y)):
+        torch_expr = f'x.astype(np.{dtype_x}) {op} y.astype(np.{dtype_x})'
+    elif (dtype_y in uint_dtypes and dtype_x in int_dtypes and _bitwidth(dtype_y) >= _bitwidth(dtype_x)):
+        torch_expr = f'x.astype(np.{dtype_y}) {op} y.astype(np.{dtype_y})'
     else:
-        _test_binary(dtype_x, dtype_y, expr, device=device)
+        torch_expr = None
+    if 'float' in dtype_x + dtype_y:
+        with pytest.raises(triton.code_gen.CompilationError) as exc_info:
+            _test_binary(dtype_x, dtype_y, expr, torch_expr='np.array([])', device=device)
+        # The CompilationError must have been caused by a C++ exception with this text.
+        assert re.match('invalid operands of type', str(exc_info.value.__cause__))
+    else:
+        _test_binary(dtype_x, dtype_y, expr, torch_expr, device=device)
+
+
+@pytest.mark.parametrize("dtype_x, dtype_y, op", [
+    (dtype_x, dtype_y, op)
+    for op in ['<<', '>>']
+    for dtype_x in int_dtypes + uint_dtypes
+    for dtype_y in int_dtypes + uint_dtypes
+])
+def test_shift_op(dtype_x, dtype_y, op, device='cuda'):
+    expr = f'x {op} y'
+    bw = max(_bitwidth(dtype_x), _bitwidth(dtype_y))
+    dtype_z = f'uint{bw}'
+    torch_expr = f'x.astype(np.{dtype_z}) {op} y.astype(np.{dtype_z})'
+    _test_binary(dtype_x, dtype_y, expr, torch_expr, device=device, y_low=0, y_high=65)
 
 
 # ---------------
 # test compare ops
 # ---------------
 ops = ['==', '!=', '>', '<', '>=', '<=']
-@pytest.mark.parametrize("dtype_x, dtype_y, expr, mode_x, mode_y", \
+@pytest.mark.parametrize("dtype_x, dtype_y, op, mode_x, mode_y", \
 # real
 [
-    (dtype_x, dtype_y, f'x{op}y', 'real', 'real') \
+    (dtype_x, dtype_y, op, 'real', 'real') \
     for op in ops \
     for dtype_x in dtypes \
     for dtype_y in dtypes
 ] + \
 # NaNs
-[('float32', 'float32', f'x{op}y', mode_x, mode_y) \
+[('float32', 'float32', op, mode_x, mode_y) \
     for op in ops
     for mode_x, mode_y in [('nan' , 'real'),
                            ('real', 'nan'),
                            ('nan' , 'nan')]
 
 ])
-def test_compare_op(dtype_x, dtype_y, expr, mode_x, mode_y, device='cuda'):
-    _test_binary(dtype_x, dtype_y, expr, mode_x=mode_x, mode_y=mode_y, device=device)
+def test_compare_op(dtype_x, dtype_y, op, mode_x, mode_y, device='cuda'):
+    expr = f'x {op} y'
+    if (dtype_x in uint_dtypes and dtype_y in int_dtypes and _bitwidth(dtype_x) >= _bitwidth(dtype_y)):
+        torch_expr = f'x.astype(np.{dtype_x}) {op} y.astype(np.{dtype_x})'
+    elif (dtype_y in uint_dtypes and dtype_x in int_dtypes and _bitwidth(dtype_y) >= _bitwidth(dtype_x)):
+        torch_expr = f'x.astype(np.{dtype_y}) {op} y.astype(np.{dtype_y})'
+    else:
+        torch_expr = None
+    #print('XXXX2', torch_expr)
+    _test_binary(dtype_x, dtype_y, expr, torch_expr, mode_x=mode_x, mode_y=mode_y, device=device)
 
 
 # ---------------
@@ -419,16 +470,17 @@ def test_atomic_rmw(op, dtype_x_str, mode, device='cuda'):
     neutral = {'add': 0, 'max': max_neutral, 'min': min_neutral}[op]
 
     # triton result
-    x = numpy_random((n_programs, ), dtype_str=dtype_x_str)
+    rs = RandomState(17)
+    x = numpy_random((n_programs, ), dtype_str=dtype_x_str, rs=rs)
     if mode == 'all_neg':
         x = -np.abs(x)
     if mode == 'all_pos':
         x = np.abs(x)
     if mode == 'min_neg':
-        idx = np.random.randint(n_programs, size=(1, )).item()
+        idx = rs.randint(n_programs, size=(1, )).item()
         x[idx] = -np.max(np.abs(x)) - 1
     if mode == 'max_pos':
-        idx = np.random.randint(n_programs, size=(1, )).item()
+        idx = rs.randint(n_programs, size=(1, )).item()
         x[idx] = np.max(np.abs(x)) + 1
     x_tri = numpy_to_triton(x, device=device)
 

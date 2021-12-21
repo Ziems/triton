@@ -68,9 +68,12 @@ ir::type *computation_type(ir::type* a_ty, ir::type* b_ty, DivOrMod div_or_mod) 
     }
   }
   if (!a_ty->is_integer_ty() || !b_ty->is_integer_ty())
-    throw_unreachable("augment_types");
+    throw_unreachable("computation_type");
   // 4 ) both operands are integer and undergo
   //    integer promotion
+  if (div_or_mod == DivOrMod::YES && a_ty->get_integer_signedness() != b_ty->get_integer_signedness()) {
+    throw semantic_error("Cannot use // or % with " + a_ty->repr() + " and " + b_ty->repr() + " because they have different signedness; this is unlikely to result in a useful answer. Cast them to the same signedness.");
+  }
   return integer_promote(a_ty, b_ty);
 }
 
@@ -207,12 +210,21 @@ ir::value *dispatch::floordiv(ir::value *input, ir::value *other, ir::builder *b
 ir::value *dispatch::mod(ir::value *input, ir::value *other, ir::builder *builder) {
   binary_op_type_checking(input, other, builder, false, false, true, DivOrMod::YES);
   ir::type *scalar_ty = input->get_type()->get_scalar_ty();
+  ir::type *other_scalar_ty = other->get_type()->get_scalar_ty();
   // float % int
   if (scalar_ty->is_floating_point_ty())
     return builder->create_frem(input, other);
   // int % int
-  else if (scalar_ty->is_integer_ty())
-    return builder->create_srem(input, other);
+  else if (scalar_ty->is_integer_ty()) {
+    if (scalar_ty->get_integer_signedness() != other_scalar_ty->get_integer_signedness()) {
+      throw semantic_error("Cannot mod " + scalar_ty->repr() + " by " + other_scalar_ty->repr() + " because they have different signedness; this is unlikely to result in a useful answer. Cast them to the same signedness.");
+    }
+    if (scalar_ty->get_integer_signedness() == signedness::UNSIGNED) {
+      return builder->create_urem(input, other);
+    } else {
+      return builder->create_srem(input, other);
+    }
+  }
   return throw_unreachable("mod");
 }
 
@@ -223,10 +235,11 @@ void bitwise_op_type_checking(ir::value *&input, ir::value *&other, ir::builder 
   ir::type *other_sca_ty = other->get_type()->get_scalar_ty();
   if(!input_sca_ty->is_integer_ty() || !other_sca_ty->is_integer_ty())
     throw_incompatible_types(input_sca_ty, other_sca_ty);
-  if(input_sca_ty->get_integer_bitwidth() < other_sca_ty->get_integer_bitwidth())
-    input = dispatch::cast(input, other_sca_ty, builder);
-  else if(other_sca_ty->get_integer_bitwidth() < input_sca_ty->get_integer_bitwidth())
-    other = dispatch::cast(other, input_sca_ty, builder);
+  ir::type *ret_sca_ty = integer_promote(input_sca_ty, other_sca_ty);
+  if (ret_sca_ty != input_sca_ty)
+    input = dispatch::cast(input, ret_sca_ty, builder);
+  if (ret_sca_ty != other_sca_ty)
+    other = dispatch::cast(other, ret_sca_ty, builder);
 }
 
 ir::value *dispatch::and_(ir::value *input, ir::value *other, ir::builder *builder) {
@@ -511,7 +524,7 @@ ir::value *dispatch::cast(ir::value *input, ir::type *dst_ty, ir::builder *build
   }
   // int -> Float
   if (src_sca_ty->is_integer_ty() && dst_sca_ty->is_floating_point_ty()){
-    if(src_sca_ty->is_bool_ty())
+    if(src_sca_ty->is_bool_ty() || src_sca_ty->get_integer_signedness() == signedness::UNSIGNED)
       return builder->create_ui_to_fp(input, dst_ty);
     else
       return builder->create_si_to_fp(input, dst_ty);
@@ -532,9 +545,7 @@ ir::value *dispatch::cast(ir::value *input, ir::type *dst_ty, ir::builder *build
       other = builder->create_splat(other, src_ty->get_block_shapes());
     return builder->create_icmpNE(input, other);
   }
-  std::ostringstream ss;
-  ss << "cast1 from " << src_sca_ty->repr() << " to " << dst_sca_ty->repr();
-  return throw_unreachable(ss.str());
+  return throw_unreachable("cast from " + src_sca_ty->repr() + " to " + dst_sca_ty->repr());
 }
 
 //===----------------------------------------------------------------------===//
